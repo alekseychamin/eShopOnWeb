@@ -1,0 +1,272 @@
+# .NET Desktop
+# Build and run tests for .NET Desktop or Windows classic desktop solutions.
+# Add steps that publish symbols, save build artifacts, and more:
+# https://docs.microsoft.com/azure/devops/pipelines/apps/windows/dot-net
+
+variables: 
+- group: AzureResourcesVariableGroup
+
+trigger:
+- none
+
+stages:
+- stage: CreateAzureResources
+  jobs:
+    - job: CreateAzureResources
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - task: AzureCLI@2
+          inputs:
+            azureSubscription: 'eshoponweb_ci'
+            scriptType: 'pscore'
+            scriptLocation: 'inlineScript'
+            inlineScript: |
+              # create a resource group
+              az group create -l $GROUPLOCATION -n $RESOURCEGROUPNAME
+              
+              # create and configure Azure SQL logical server and Azure SQL database
+              az sql server create -l $(GROUPLOCATION) -g $(RESOURCEGROUPNAME) -n $(SQLSRVNAME) -u $(USERNAME) -p $(PASSWORD)
+              az sql db create -g $(RESOURCEGROUPNAME) -s $(SQLSRVNAME) -n $(DBNAMECATALOG) --service-objective Basic
+              az sql db create -g $(RESOURCEGROUPNAME) -s $(SQLSRVNAME) -n $(DBNAMEIDENTITY) --service-objective Basic
+              az sql server firewall-rule create -g $(RESOURCEGROUPNAME) -s $(SQLSRVNAME) -n allowazure --start-ip-address 0.0.0.0 --end-ip-address 0.0.0.0
+              
+              # create and configure an Azure App Service plan and an Azure web app
+              az appservice plan create -g $(RESOURCEGROUPNAME) -n $(WEBPLANNAME1) --l $(WEBLOCATION1) --sku S1
+              az appservice plan create -g $(RESOURCEGROUPNAME) -n $(WEBPLANNAME2) --l $(WEBLOCATION2) --sku S1
+              az webapp create -g $(RESOURCEGROUPNAME) -p $(WEBPLANNAME1) -n $(WEBAPPNAME1)
+              az webapp create -g $(RESOURCEGROUPNAME) -p $(WEBPLANNAME2) -n $(WEBAPPNAME2)
+              
+              az webapp cors remove -g $(RESOURCEGROUPNAME) -n $(WEBAPPNAME1) --allowed-origins '*'
+              az webapp cors add --allowed-origins '*' -n $(WEBAPPNAME1) -g $(RESOURCEGROUPNAME)
+
+              az webapp cors remove -g $(RESOURCEGROUPNAME) -n $(WEBAPPNAME2) --allowed-origins '*'
+              az webapp cors add --allowed-origins '*' -n $(WEBAPPNAME2) -g $(RESOURCEGROUPNAME)
+
+              az appservice plan create -g $(RESOURCEGROUPNAME) -n $(APIPLANNAME) --is-linux
+              az webapp create -g $(RESOURCEGROUPNAME) -p $(APIPLANNAME) -n $(APIAPPNAME) --deployment-container-image-name '$(ACRNAME).azurecr.io/$(APIREPOSITORYNAME):latest'
+
+              az webapp cors remove -g $(RESOURCEGROUPNAME) -n $(APIAPPNAME) --allowed-origins '*'
+              az webapp cors add --allowed-origins '*' -n $(APIAPPNAME) -g $(RESOURCEGROUPNAME)
+              
+              # create auto scale for webapps
+              $planid1 = $(az resource show -g $(RESOURCEGROUPNAME) -n $(WEBPLANNAME1) --resource-type 'Microsoft.Web/serverfarms' --query 'id')
+              $planid2 = $(az resource show -g $(RESOURCEGROUPNAME) -n $(WEBPLANNAME2) --resource-type 'Microsoft.Web/serverfarms' --query 'id')
+
+              az monitor autoscale create -g $(RESOURCEGROUPNAME) --resource $planid1 --min-count 1 --max-count 2 --count 1
+              az monitor autoscale rule create -g $(RESOURCEGROUPNAME) --autoscale-name $(WEBPLANNAME1) --scale out 1 --condition "CPUPercentage > 75 avg 5m"
+              az monitor autoscale rule create -g $(RESOURCEGROUPNAME) --autoscale-name $(WEBPLANNAME1) --scale in 1 --condition "CPUPercentage < 25 avg 5m"
+              
+              az monitor autoscale create -g $(RESOURCEGROUPNAME) --resource $planid2 --min-count 1 --max-count 2 --count 1
+              az monitor autoscale rule create -g $(RESOURCEGROUPNAME) --autoscale-name $(WEBPLANNAME2) --scale out 1 --condition "CPUPercentage > 75 avg 5m"
+              az monitor autoscale rule create -g $(RESOURCEGROUPNAME) --autoscale-name $(WEBPLANNAME2) --scale in 1 --condition "CPUPercentage < 25 avg 5m"
+
+              # create traffic-manager
+              $webappid1 = $(az resource show -g $(RESOURCEGROUPNAME) -n $(WEBAPPNAME1) --resource-type 'Microsoft.Web/sites' --query 'id')
+              $webappid2 = $(az resource show -g $(RESOURCEGROUPNAME) -n $(WEBAPPNAME2) --resource-type 'Microsoft.Web/sites' --query 'id')
+
+              az network traffic-manager profile create -g $(RESOURCEGROUPNAME) -n $(TMPROFILENAME) --routing-method Performance --unique-dns-name $(TMDNSNAME) --ttl 30 --protocol HTTPS --path "/"
+              az network traffic-manager endpoint create -g $(RESOURCEGROUPNAME) --profile-name $(TMPROFILENAME) -n $(WEBAPPNAME1) --type azureEndpoints --target-resource-id $webappid1 --endpoint-status enabled
+              az network traffic-manager endpoint create -g $(RESOURCEGROUPNAME) --profile-name $(TMPROFILENAME) -n $(WEBAPPNAME2) --type azureEndpoints --target-resource-id $webappid2 --endpoint-status enabled
+
+              # create storage account
+              az storage account create -n $(STORAGENAME) -l $(GROUPLOCATION) -g $(RESOURCEGROUPNAME) --sku Standard_LRS
+              
+              $connectionString = $(az storage account show-connection-string -g $(RESOURCEGROUPNAME) -n $(STORAGENAME) --query 'connectionString')
+
+              # create funcs
+              az functionapp create -n $(FUNAPPCRESERVERNAME) --storage-account $(STORAGENAME) --consumption-plan-location $(GROUPLOCATION) -g $(RESOURCEGROUPNAME) --functions-version 3 --disable-app-insights true
+              az functionapp create -n $(FUNAPPCDELIVERYNAME) --storage-account $(STORAGENAME) --consumption-plan-location $(GROUPLOCATION) -g $(RESOURCEGROUPNAME) --functions-version 3 --disable-app-insights true
+
+              # create servicebus
+              az servicebus namespace create --resource-group $(RESOURCEGROUPNAME) --name $(SERVICEBUSNAMESPACE) --location $(GROUPLOCATION)
+              az servicebus queue create --resource-group $(RESOURCEGROUPNAME) --namespace-name $(SERVICEBUSNAMESPACE) --name $(SERVICEBUSQUEUENAME)
+
+              # create cosmos db
+              az cosmosdb create -n $(COSMOSACCOUNTNAME) -g $(RESOURCEGROUPNAME)
+              az cosmosdb sql database create -a $(COSMOSACCOUNTNAME) -n $(COSMOSDBID) -g $(RESOURCEGROUPNAME)
+
+              $endpointuri = $(az resource show -g $(RESOURCEGROUPNAME) -n $(COSMOSACCOUNTNAME) --resource-type 'Microsoft.DocumentDB/databaseAccounts' --query 'properties.documentEndpoint')
+              $primarykey = $(az cosmosdb keys list --name $(COSMOSACCOUNTNAME) --resource-group $(RESOURCEGROUPNAME) --type keys --query 'primaryMasterKey')
+
+              # set keys to funcs
+              $funcdeliverysettings = 
+                "EndpointUri=$endpointuri",
+                "PrimaryKey=$primarykey",
+                "CosmosDbId=$(COSMOSDBID)",
+                "CosmosContainerId=$(COSMOSCONTAINERID)",
+                "CosmosDbPartionKeyPath=$(COSMOSDBPARTIONKEYPATH)"
+              
+              az functionapp config appsettings set -g $(RESOURCEGROUPNAME) -n $(FUNAPPCDELIVERYNAME) --settings $funcdeliverysettings
+
+              $funcorder =
+                "StorageConnectionString=$connectionString",
+                "ContainerName=$(STORAGECONTAINERNAME)"
+              
+              az functionapp config appsettings set -g $(RESOURCEGROUPNAME) -n $(FUNAPPCRESERVERNAME) --settings $funcorder
+
+
+
+- stage: BuildAndDeploy
+  jobs:
+  - job: BuildAndDeploy
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    variables:
+      websolution: '**/src/Web/Web.csproj'
+      apidockerfile: '**/src/PublicApi/Dockerfile'
+      funcdelivery: '**/src/DeliveryOrderProcessorService/DeliveryOrderProcessorService.csproj'
+      funcorder: '**/src/OrderItemsReserverService/OrderItemsReserverService.csproj'
+      baseUrls.apiBase: 'https://$(APIAPPNAME).azurewebsites.net/api/'
+      baseUrls.webBase: 'http://$(TMPROFILENAME).trafficmanager.net'
+      buildConfiguration: 'Release'
+
+    steps:
+    - task: DotNetCoreCLI@2
+      inputs:
+        command: publish
+        publishWebProjects: False
+        projects: '$(websolution)'
+        arguments: '--configuration $(buildConfiguration) --output $(Build.ArtifactStagingDirectory)/Web'
+        zipAfterPublish: False
+        modifyOutputPath: False
+
+    - task: DotNetCoreCLI@2
+      inputs:
+        command: publish
+        publishWebProjects: False
+        projects: '$(funcdelivery)'
+        arguments: '--configuration $(buildConfiguration) --output $(Build.ArtifactStagingDirectory)/FuncDelivery'
+        zipAfterPublish: False
+        modifyOutputPath: False
+    
+    - task: DotNetCoreCLI@2
+      inputs:
+        command: publish
+        publishWebProjects: False
+        projects: '$(funcorder)'
+        arguments: '--configuration $(buildConfiguration) --output $(Build.ArtifactStagingDirectory)/FuncOrder'
+        zipAfterPublish: False
+        modifyOutputPath: False
+    
+    - task: AzureFunctionApp@1
+      inputs:
+        azureSubscription: 'eshoponweb_ci'
+        appType: functionAppLinux
+        appName: '$(FUNAPPCDELIVERYNAME)'
+        package: '$(Build.ArtifactStagingDirectory)/FuncDelivery'
+    
+    - task: AzureFunctionApp@1
+      inputs:
+        azureSubscription: 'eshoponweb_ci'
+        appType: functionAppLinux
+        appName: '$(FUNAPPCRESERVERNAME)'
+        package: '$(Build.ArtifactStagingDirectory)/FuncOrder'
+    
+    - task: FileTransform@1
+      displayName: 'File transformation: appsettings.json'    
+      inputs:
+        folderPath: '$(Build.ArtifactStagingDirectory)/Web'
+        fileType: 'json'
+        targetFiles: |
+          **/appsettings.Development.json
+          **/appsettings.json
+    - task: AzureCLI@2
+      inputs:
+          azureSubscription: 'eshoponweb_ci'
+          scriptType: 'pscore'
+          scriptLocation: 'inlineScript'
+          inlineScript: |
+            # create keys in webapps
+            $functionKey = $(az functionapp function keys list -g $(RESOURCEGROUPNAME) -n $(FUNAPPCDELIVERYNAME) --function-name $(FUNCDELIVERYNAME) --query 'default' -o tsv)
+            $functionurl = $(az functionapp function show --function-name $(FUNCDELIVERYNAME) -n $(FUNAPPCDELIVERYNAME) -g $(RESOURCEGROUPNAME) --query 'invokeUrlTemplate' -o tsv)
+            $servicebusconnection = $(az servicebus namespace authorization-rule keys list --resource-group $(RESOURCEGROUPNAME) --namespace-name $(SERVICEBUSNAMESPACE) --name RootManageSharedAccessKey --query primaryConnectionString --output tsv)
+            
+            $settings = 
+              "ASPNETCORE_ENVIRONMENT=Development",
+              "AzureFunctionConfig:Url=$functionurl",
+              "AzureFunctionConfig:Key=$functionKey",
+              "AzureServiceBusConfig:Connection=$servicebusconnection",
+              "AzureServiceBusConfig:QueueName=$(SERVICEBUSQUEUENAME)"
+            
+            az webapp config appsettings set -g $(RESOURCEGROUPNAME) -n $(WEBAPPNAME1) --settings $settings
+            az webapp config appsettings set -g $(RESOURCEGROUPNAME) -n $(WEBAPPNAME2) --settings $settings
+
+            az webapp config connection-string set -g $(RESOURCEGROUPNAME) -n $(WEBAPPNAME1) -t SQLAzure --settings CatalogConnection='Server=tcp:$(SQLSRVNAME).database.windows.net,1433;Initial Catalog=$(DBNAMECATALOG);Persist Security Info=False;User ID=$(USERNAME);Password=$(PASSWORD);MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;'
+            az webapp config connection-string set -g $(RESOURCEGROUPNAME) -n $(WEBAPPNAME1) -t SQLAzure --settings IdentityConnection='Server=tcp:$(SQLSRVNAME).database.windows.net,1433;Initial Catalog=$(DBNAMEIDENTITY);Persist Security Info=False;User ID=$(USERNAME);Password=$(PASSWORD);MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;'
+            
+            az webapp config connection-string set -g $(RESOURCEGROUPNAME) -n $(WEBAPPNAME2) -t SQLAzure --settings CatalogConnection='Server=tcp:$(SQLSRVNAME).database.windows.net,1433;Initial Catalog=$(DBNAMECATALOG);Persist Security Info=False;User ID=$(USERNAME);Password=$(PASSWORD);MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;'
+            az webapp config connection-string set -g $(RESOURCEGROUPNAME) -n $(WEBAPPNAME2) -t SQLAzure --settings IdentityConnection='Server=tcp:$(SQLSRVNAME).database.windows.net,1433;Initial Catalog=$(DBNAMEIDENTITY);Persist Security Info=False;User ID=$(USERNAME);Password=$(PASSWORD);MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;'
+    
+    - task: AzureWebApp@1
+      inputs:
+        azureSubscription: 'eshoponweb_ci'
+        appType: 'webApp'
+        appName: '$(WEBAPPNAME1)'
+        package: '$(Build.ArtifactStagingDirectory)/Web'
+    
+    - task: AzureWebApp@1
+      inputs:
+        azureSubscription: 'eshoponweb_ci'
+        appType: 'webApp'
+        appName: '$(WEBAPPNAME2)'
+        package: '$(Build.ArtifactStagingDirectory)/Web'
+    
+    - task: Docker@2
+      inputs:
+        buildContext: '$(Build.Repository.LocalPath)'
+        containerRegistry: 'eshoponweb_acr_ci'
+        repository: '$(APIREPOSITORYNAME)'
+        command: 'build'
+        tags: 'latest'
+        Dockerfile: '$(apidockerfile)'
+      displayName: 'Docker image build for Public API'
+    
+    - task: Docker@2
+      inputs:
+          containerRegistry: 'eshoponweb_acr_ci'
+          repository: '$(APIREPOSITORYNAME)'
+          command: 'push'
+          tags: 'latest'
+      displayName: 'Docker image push for Public API'
+    
+    - task: AzureRmWebAppDeployment@4
+      inputs:
+        ConnectionType: 'AzureRM'
+        azureSubscription: 'eshoponweb_ci'
+        appType: 'webAppContainer'
+        WebAppName: '$(APIAPPNAME)'
+        DockerNamespace: '$(ACRNAME).azurecr.io'
+        DockerRepository: '$(APIREPOSITORYNAME)'
+        DockerImageTag: 'latest'
+    
+    - task: AzureAppServiceSettings@1
+      inputs:
+        azureSubscription: 'eshoponweb_ci'
+        appName: '$(APIAPPNAME)'
+        resourceGroupName: '$(RESOURCEGROUPNAME)'
+        appSettings: |
+          [
+             {
+              "name": "ASPNETCORE_ENVIRONMENT",
+              "value": "Development",
+              "slotSetting": false
+             }
+          ]
+        connectionStrings: |
+          [
+            {
+              "name": "CatalogConnection",
+              "value": "Server=tcp:$(SQLSRVNAME).database.windows.net,1433;Initial Catalog=$(DBNAMECATALOG);Persist Security Info=False;User ID=$(USERNAME);Password=$(PASSWORD);MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;",
+              "type": "SqlAzure",
+              "slotSetting": false
+            },
+            {
+              "name": "IdentityConnection",
+              "value": "Server=tcp:$(SQLSRVNAME).database.windows.net,1433;Initial Catalog=$(DBNAMEIDENTITY);Persist Security Info=False;User ID=$(USERNAME);Password=$(PASSWORD);MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;",
+              "type": "SqlAzure",
+              "slotSetting": false
+            }
+          ]
+
