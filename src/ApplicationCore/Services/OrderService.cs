@@ -1,4 +1,5 @@
-﻿using Ardalis.GuardClauses;
+﻿using System;
+using Ardalis.GuardClauses;
 using Microsoft.eShopWeb.ApplicationCore.Entities;
 using Microsoft.eShopWeb.ApplicationCore.Entities.BasketAggregate;
 using Microsoft.eShopWeb.ApplicationCore.Entities.OrderAggregate;
@@ -12,6 +13,8 @@ namespace Microsoft.eShopWeb.ApplicationCore.Services
     public class OrderService : IOrderService
     {
         private readonly IAsyncRepository<Order> _orderRepository;
+        private readonly IAzureServiceBusSend _azureServiceBusSend;
+        private readonly IAzureFunctionSend _azureFunctionSend;
         private readonly IUriComposer _uriComposer;
         private readonly IAsyncRepository<Basket> _basketRepository;
         private readonly IAsyncRepository<CatalogItem> _itemRepository;
@@ -19,9 +22,13 @@ namespace Microsoft.eShopWeb.ApplicationCore.Services
         public OrderService(IAsyncRepository<Basket> basketRepository,
             IAsyncRepository<CatalogItem> itemRepository,
             IAsyncRepository<Order> orderRepository,
+            IAzureServiceBusSend azureServiceBusSend,
+            IAzureFunctionSend azureFunctionSend,
             IUriComposer uriComposer)
         {
             _orderRepository = orderRepository;
+            _azureServiceBusSend = azureServiceBusSend;
+            _azureFunctionSend = azureFunctionSend;
             _uriComposer = uriComposer;
             _basketRepository = basketRepository;
             _itemRepository = itemRepository;
@@ -49,6 +56,19 @@ namespace Microsoft.eShopWeb.ApplicationCore.Services
             var order = new Order(basket.BuyerId, shippingAddress, items);
 
             await _orderRepository.AddAsync(order);
+
+            var sendOrder = new
+            {
+                id = Guid.NewGuid(),
+                ShipToAddress = order.ShipToAddress.City,
+                OrderItems = order.OrderItems.Select(x => x.ItemOrdered.ProductName).ToList(),
+                TotalPrice = order.Total(),
+                OrderTotal = order
+            };
+
+            await _azureServiceBusSend.SendOrder(sendOrder);
+
+            await _azureFunctionSend.SendOrder(sendOrder);
         }
     }
 }

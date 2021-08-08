@@ -26,6 +26,8 @@ using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Net.Mime;
+using Microsoft.eShopWeb.ApplicationCore.Model;
+using Microsoft.eShopWeb.ApplicationCore.Services;
 
 namespace Microsoft.eShopWeb.Web
 {
@@ -43,10 +45,10 @@ namespace Microsoft.eShopWeb.Web
         public void ConfigureDevelopmentServices(IServiceCollection services)
         {
             // use in-memory database
-            ConfigureInMemoryDatabases(services);
+            //ConfigureInMemoryDatabases(services);
 
             // use real database
-            //ConfigureProductionServices(services);
+            ConfigureProductionServices(services);
         }
 
         public void ConfigureDockerServices(IServiceCollection services)
@@ -112,6 +114,12 @@ namespace Microsoft.eShopWeb.Web
                                        .AddDefaultTokenProviders();
 
             services.AddScoped<ITokenClaimsService, IdentityTokenClaimService>();
+
+            services.Configure<AzureServiceBusConfig>(Configuration.GetSection("AzureServiceBusConfig"));
+            services.Configure<AzureFunctionConfig>(Configuration.GetSection("AzureFunctionConfig"));
+            
+            services.AddScoped<IAzureServiceBusSend, AzureServiceBusSend>();
+            services.AddScoped<IAzureFunctionSend, AzureFunctionSend>();
 
             services.AddCoreServices(Configuration);
             services.AddWebServices(Configuration);
